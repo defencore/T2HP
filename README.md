@@ -131,6 +131,15 @@ DNS request from 192.168.9.100:43049 -> domain: a.nel.cloudflare.com
 DNS request from 192.168.9.100:27700 -> domain: a.nel.cloudflare.com
 ```
 
+Remove firewall rules:
+
+```
+nft delete table inet t2hp
+nft list ruleset
+```
+
+---
+
 ## License
 
 This project is licensed under the MIT License.
