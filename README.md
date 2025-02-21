@@ -117,14 +117,19 @@ Example output:
 ```sh
 Starting local TCP proxy on port 9040 -> 192.168.8.100:8080
 Starting local DNS proxy on port 9053 -> DNS server 1.1.1.1
-DNS request logging is enabled.
+DNS and TCP request logging is enabled.
 TCP server listening on port 9040
 UDP server (DNS proxy) listening on port 9053
-DNS request from 192.168.9.100 -> domain: accounts.google.com
-DNS request from 192.168.9.100 -> domain: ifconfig.io
-DNS request from 192.168.9.100 -> domain: google-ohttp-relay-safebrowsing.fastly-edge.com
-DNS request from 192.168.9.100 -> domain: www.google.com
-DNS request from 192.168.9.100 -> domain: connectivitycheck.gstatic.com
+DNS request from 192.168.9.100:58227 -> domain: clientservices.googleapis.com
+TCP: 192.168.9.100:42004 -> clientservices.googleapis.com:443
+DNS request from 192.168.9.100:28069 -> domain: accounts.google.com
+TCP: 192.168.9.100:46672 -> accounts.google.com:443
+DNS request from 192.168.9.100:37820 -> domain: connectivitycheck.gstatic.com
+TCP: 192.168.9.100:37568 -> connectivitycheck.gstatic.com:80
+DNS request from 192.168.9.100:35392 -> domain: ifconfig.io
+TCP: 192.168.9.100:44902 -> ifconfig.io:443
+DNS request from 192.168.9.100:43049 -> domain: a.nel.cloudflare.com
+DNS request from 192.168.9.100:27700 -> domain: a.nel.cloudflare.com
 ```
 
 ## License
