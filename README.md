@@ -90,22 +90,21 @@ Start `t2hp` on the OpenWRT device:
 ```
 root@GL-XE300:/tmp# ./t2hp -h
 
-Usage: ./t2hp [OPTIONS]
+sage: ./t2hp [OPTIONS]
 
   --local-tcp <port>       TCP port to listen on locally (default 9040)
   --local-dns <port>       UDP port to listen on locally for DNS (default 9053)
   --http-proxy <host:port> Remote proxy server (default 192.168.8.100:8080)
   --dns <ip>               DNS server address (default 8.8.8.8)
-  --show-requests          Print client IP and requested domain name (DNS)
+  --show-requests          Print logs of DNS/TCP connections with domain and port if possible
   -h, --help               Show this help message
 
 Example:
-  ./t2hp --local-tcp 9040 --local-dns 9053 \
-     --http-proxy 192.168.8.100:8080 --dns 8.8.8.8 --show-requests
+  ./t2hp --local-tcp 9040 --local-dns 9053 --http-proxy 192.168.8.100:8080 --dns 8.8.8.8 --show-requests
 
-This application creates a local TCP proxy on --local-tcp and a DNS proxy on --local-dns.
-TCP connections are forwarded to the specified --http-proxy. DNS queries are forwarded
-to the specified --dns server. With --show-requests you can see DNS queries.
+TCP output:   TCP: <client_ip>:<client_port> -> <domain>:<port>
+DNS output:   DNS request from <client_ip>:<client_port> -> domain: <domain>
+Domain might remain 'unknown' if we can't parse HTTP/HTTPS headers or SNI.
 ```
 
 ```sh
