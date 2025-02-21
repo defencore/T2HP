@@ -9,11 +9,11 @@
 #include <getopt.h>
 #include <sys/select.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #define BUFFER_SIZE 8192
 #define MAX_HOSTNAME 256
 #define max(a, b) ((a) > (b) ? (a) : (b))
-
 #define DEFAULT_LOCAL_TCP 9040
 #define DEFAULT_LOCAL_UDP 9053
 #define DEFAULT_PROXY_HOST "192.168.8.100"
@@ -28,8 +28,25 @@ struct proxy_params {
     char dns_server[INET_ADDRSTRLEN];
 };
 
+struct tcp_client_info {
+    int client_sock;
+    struct sockaddr_in client_addr;
+};
+
 static struct proxy_params global_params;
 static bool show_requests = false;
+
+static char *my_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    size_t needle_len = strlen(needle);
+    if (!needle_len) return (char*)haystack;
+    for (; *haystack; haystack++) {
+        if (strncasecmp(haystack, needle, needle_len) == 0) {
+            return (char*)haystack;
+        }
+    }
+    return NULL;
+}
 
 static void parse_dns_name(const unsigned char* packet, size_t pkt_size, char* out, size_t out_size) {
     if (pkt_size < 12) {
@@ -39,9 +56,7 @@ static void parse_dns_name(const unsigned char* packet, size_t pkt_size, char* o
     size_t pos = 0;
     const unsigned char* ptr = packet + 12;
     while (*ptr) {
-        if (pos >= out_size - 1) {
-            break;
-        }
+        if (pos >= out_size - 1) break;
         if ((*ptr & 0xc0) == 0xc0) {
             snprintf(out, out_size, "compressed");
             return;
@@ -51,9 +66,7 @@ static void parse_dns_name(const unsigned char* packet, size_t pkt_size, char* o
             snprintf(out, out_size, "bad-length");
             return;
         }
-        if (pos > 0 && pos < out_size - 1) {
-            out[pos++] = '.';
-        }
+        if (pos > 0 && pos < out_size - 1) out[pos++] = '.';
         for (int i = 0; i < len; i++) {
             if (pos < out_size - 1 && ptr < packet + pkt_size) {
                 out[pos++] = *ptr++;
@@ -62,15 +75,120 @@ static void parse_dns_name(const unsigned char* packet, size_t pkt_size, char* o
             }
         }
     }
-    if (*ptr == 0) {
-        ptr++;
-    }
+    if (*ptr == 0) ptr++;
     out[pos] = '\0';
 }
 
-void *handle_tcp_connection(void *client_socket) {
-    int client_sock = *(int*)client_socket;
-    free(client_socket);
+static void parse_http_domain_port(const char *data, char *domain, size_t dsize, int *port) {
+    const char *connect = "CONNECT ";
+    const char *host_hdr = "Host:";
+    const char *p;
+    *port = 80;
+
+    if (!strncmp(data, connect, strlen(connect))) {
+        p = data + strlen(connect);
+        while (*p && (*p == ' ')) p++;
+        snprintf(domain, dsize, "%s", p);
+        char *sp = strchr(domain, ' ');
+        if (sp) *sp = '\0';
+        sp = strchr(domain, '\r');
+        if (sp) *sp = '\0';
+        sp = strchr(domain, '\n');
+        if (sp) *sp = '\0';
+        if ((sp = strchr(domain, ':'))) {
+            *port = atoi(sp + 1);
+            *sp = '\0';
+        } else {
+            *port = 443;
+        }
+        return;
+    }
+
+    p = my_strcasestr(data, host_hdr);
+    if (p) {
+        p += strlen(host_hdr);
+        while (*p && (*p == ' ' || *p == '\t')) p++;
+        snprintf(domain, dsize, "%s", p);
+        char *sp = strchr(domain, '\r');
+        if (sp) *sp = '\0';
+        sp = strchr(domain, '\n');
+        if (sp) *sp = '\0';
+        if ((sp = strchr(domain, ':'))) {
+            *port = atoi(sp + 1);
+            *sp = '\0';
+        }
+    }
+}
+
+static bool parse_tls_sni(const unsigned char *data, size_t len, char *out, size_t out_size, int *port) {
+    if (len < 5) return false;
+    if (data[0] != 0x16) return false;
+    if (data[1] != 0x03) return false;
+    int tls_len = (data[3] << 8) + data[4];
+    if (tls_len < 0 || tls_len + 5 > (int)len) return false;
+    const unsigned char *p = data + 5;
+    int handshake_len = tls_len;
+    if (handshake_len < 4) return false;
+    if (p[0] != 0x01) return false;
+    int ch_len = (p[1] << 16) | (p[2] << 8) | p[3];
+    if (ch_len < 0 || ch_len + 4 > handshake_len) return false;
+    p += 4;
+    handshake_len -= 4;
+    if (handshake_len < 34) return false;
+    p += 34;
+    handshake_len -= 34;
+    if (handshake_len < 1) return false;
+    int session_id_len = p[0];
+    if (session_id_len < 0 || session_id_len + 1 > handshake_len) return false;
+    p += 1 + session_id_len;
+    handshake_len -= 1 + session_id_len;
+    if (handshake_len < 2) return false;
+    int cipher_len = (p[0] << 8) | p[1];
+    if (cipher_len < 0 || cipher_len + 2 > handshake_len) return false;
+    p += 2 + cipher_len;
+    handshake_len -= 2 + cipher_len;
+    if (handshake_len < 1) return false;
+    int comp_len = p[0];
+    if (comp_len < 0 || comp_len + 1 > handshake_len) return false;
+    p += 1 + comp_len;
+    handshake_len -= 1 + comp_len;
+    if (handshake_len < 2) return false;
+    int ext_len = (p[0] << 8) | p[1];
+    p += 2;
+    handshake_len -= 2;
+    if (ext_len < 0 || ext_len > handshake_len) return false;
+    while (ext_len >= 4) {
+        int ext_type = (p[0] << 8) | p[1];
+        int ext_size = (p[2] << 8) | p[3];
+        p += 4;
+        ext_len -= 4;
+        if (ext_size < 0 || ext_size > ext_len) return false;
+        if (ext_type == 0x0000) {
+            const unsigned char *server_name_list = p + 2;
+            int server_name_list_len = (p[0] << 8) | p[1];
+            if (server_name_list_len <= ext_size - 2 && server_name_list_len > 3) {
+                if (server_name_list[0] == 0x00) {
+                    int name_len = (server_name_list[1] << 8) | server_name_list[2];
+                    if (name_len > 0 && name_len <= server_name_list_len - 3) {
+                        if (name_len >= (int)out_size) name_len = out_size - 1;
+                        memcpy(out, &server_name_list[3], name_len);
+                        out[name_len] = '\0';
+                        *port = 443;
+                        return true;
+                    }
+                }
+            }
+        }
+        p += ext_size;
+        ext_len -= ext_size;
+    }
+    return false;
+}
+
+void *handle_tcp_connection(void *arg) {
+    struct tcp_client_info info = *(struct tcp_client_info*)arg;
+    free(arg);
+    int client_sock = info.client_sock;
     int proxy_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (proxy_sock < 0) {
         perror("Proxy socket creation failed");
@@ -88,20 +206,36 @@ void *handle_tcp_connection(void *client_socket) {
         close(proxy_sock);
         return NULL;
     }
+
     char buffer[BUFFER_SIZE];
-    ssize_t bytes;
-    bytes = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
+    ssize_t bytes = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
+
     if (bytes > 0) {
         buffer[bytes] = '\0';
+
+        if (show_requests) {
+            char domain[256] = "unknown";
+            int port = 0;
+            parse_http_domain_port(buffer, domain, sizeof(domain), &port);
+            if (!strcmp(domain, "unknown")) {
+                if (parse_tls_sni((unsigned char*)buffer, bytes, domain, sizeof(domain), &port)) {
+                }
+            }
+            if (!port) port = 80;
+            char client_ip[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &info.client_addr.sin_addr, client_ip, sizeof(client_ip));
+            printf("TCP: %s:%d -> %s:%d\n",
+                   client_ip, ntohs(info.client_addr.sin_port),
+                   domain, port);
+        }
         send(proxy_sock, buffer, bytes, 0);
+
         fd_set fds;
         while (1) {
             FD_ZERO(&fds);
             FD_SET(client_sock, &fds);
             FD_SET(proxy_sock, &fds);
-            if (select(max(client_sock, proxy_sock) + 1, &fds, NULL, NULL, NULL) < 0) {
-                break;
-            }
+            if (select(max(client_sock, proxy_sock) + 1, &fds, NULL, NULL, NULL) < 0) break;
             if (FD_ISSET(client_sock, &fds)) {
                 bytes = recv(client_sock, buffer, BUFFER_SIZE, 0);
                 if (bytes <= 0) break;
@@ -114,6 +248,7 @@ void *handle_tcp_connection(void *client_socket) {
             }
         }
     }
+
     close(client_sock);
     close(proxy_sock);
     return NULL;
@@ -125,6 +260,8 @@ void start_tcp_server(struct proxy_params *params) {
         perror("TCP socket creation failed");
         exit(1);
     }
+    int on = 1;
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
@@ -140,18 +277,20 @@ void start_tcp_server(struct proxy_params *params) {
         exit(1);
     }
     printf("TCP server listening on port %d\n", params->local_tcp_port);
+
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        int *client_sock = malloc(sizeof(int));
-        *client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
-        if (*client_sock < 0) {
+        int client_fd = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
             perror("Accept failed");
-            free(client_sock);
             continue;
         }
+        struct tcp_client_info *info = malloc(sizeof(*info));
+        info->client_sock = client_fd;
+        memcpy(&info->client_addr, &client_addr, sizeof(client_addr));
         pthread_t thread;
-        pthread_create(&thread, NULL, handle_tcp_connection, client_sock);
+        pthread_create(&thread, NULL, handle_tcp_connection, info);
         pthread_detach(thread);
     }
 }
@@ -162,6 +301,8 @@ void start_udp_server(struct proxy_params *params) {
         perror("UDP socket creation failed");
         exit(1);
     }
+    int on = 1;
+    setsockopt(udp_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
@@ -172,12 +313,14 @@ void start_udp_server(struct proxy_params *params) {
         exit(1);
     }
     printf("UDP server (DNS proxy) listening on port %d\n", params->local_udp_port);
+
     char buffer[BUFFER_SIZE];
     struct sockaddr_in client_addr, dns_addr;
     socklen_t client_len = sizeof(client_addr);
     dns_addr.sin_family = AF_INET;
     dns_addr.sin_port = htons(53);
     inet_pton(AF_INET, params->dns_server, &dns_addr.sin_addr);
+
     while (1) {
         ssize_t bytes = recvfrom(udp_sock, buffer, BUFFER_SIZE, 0,
                                  (struct sockaddr*)&client_addr, &client_len);
@@ -191,7 +334,8 @@ void start_udp_server(struct proxy_params *params) {
             char client_ip[INET_ADDRSTRLEN] = {0};
             inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
             if (strcmp(client_ip, params->dns_server) != 0) {
-                printf("DNS request from %s -> domain: %s\n", client_ip, domain);
+                printf("DNS request from %s:%d -> domain: %s\n",
+                       client_ip, ntohs(client_addr.sin_port), domain);
             }
         }
         sendto(udp_sock, buffer, bytes, 0, (struct sockaddr*)&dns_addr, sizeof(dns_addr));
@@ -206,21 +350,18 @@ void start_udp_server(struct proxy_params *params) {
 
 void print_usage(const char *progname) {
     printf("\nUsage: %s [OPTIONS]\n", progname);
-    printf("\n  --local-tcp <port>       TCP port to listen on locally (default %d)\n",
-           DEFAULT_LOCAL_TCP);
-    printf("  --local-dns <port>       UDP port to listen on locally for DNS (default %d)\n",
-           DEFAULT_LOCAL_UDP);
-    printf("  --http-proxy <host:port> Remote proxy server (default %s:%d)\n",
-           DEFAULT_PROXY_HOST, DEFAULT_PROXY_PORT);
+    printf("\n  --local-tcp <port>       TCP port to listen on locally (default %d)\n", DEFAULT_LOCAL_TCP);
+    printf("  --local-dns <port>       UDP port to listen on locally for DNS (default %d)\n", DEFAULT_LOCAL_UDP);
+    printf("  --http-proxy <host:port> Remote proxy server (default %s:%d)\n", DEFAULT_PROXY_HOST, DEFAULT_PROXY_PORT);
     printf("  --dns <ip>               DNS server address (default %s)\n", DEFAULT_DNS_SERVER);
-    printf("  --show-requests          Print client IP and requested domain name (DNS)\n");
+    printf("  --show-requests          Print logs of DNS/TCP connections with domain and port if possible\n");
     printf("  -h, --help               Show this help message\n\n");
     printf("Example:\n");
-    printf("  %s --local-tcp 9040 --local-dns 9053 \\\n", progname);
-    printf("     --http-proxy 192.168.8.100:8080 --dns 8.8.8.8 --show-requests\n\n");
-    printf("This application creates a local TCP proxy on --local-tcp and a DNS proxy on --local-dns.\n");
-    printf("TCP connections are forwarded to the specified --http-proxy. DNS queries are forwarded\n");
-    printf("to the specified --dns server. With --show-requests you can see DNS queries.\n\n");
+    printf("  %s --local-tcp 9040 --local-dns 9053 --http-proxy 192.168.8.100:8080 --dns 8.8.8.8 --show-requests\n\n",
+           progname);
+    printf("TCP output:   TCP: <client_ip>:<client_port> -> <domain>:<port>\n");
+    printf("DNS output:   DNS request from <client_ip>:<client_port> -> domain: <domain>\n");
+    printf("Domain might remain 'unknown' if we can't parse HTTP/HTTPS headers or SNI.\n\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -230,6 +371,7 @@ int main(int argc, char *argv[]) {
     params.local_tcp_port = DEFAULT_LOCAL_TCP;
     params.local_udp_port = DEFAULT_LOCAL_UDP;
     strcpy(params.dns_server, DEFAULT_DNS_SERVER);
+
     static struct option long_options[] = {
         {"local-tcp",     required_argument, 0, 't'},
         {"local-dns",     required_argument, 0, 'd'},
@@ -239,6 +381,7 @@ int main(int argc, char *argv[]) {
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
+
     int opt, long_index;
     while ((opt = getopt_long(argc, argv, "ht:d:x:n:s", long_options, &long_index)) != -1) {
         switch (opt) {
@@ -273,17 +416,21 @@ int main(int argc, char *argv[]) {
                 exit(1);
         }
     }
+
     global_params = params;
+
     printf("Starting local TCP proxy on port %d -> %s:%d\n",
            params.local_tcp_port, params.remote_host, params.remote_port);
     printf("Starting local DNS proxy on port %d -> DNS server %s\n",
            params.local_udp_port, params.dns_server);
     if (show_requests) {
-        printf("DNS request logging is enabled.\n");
+        printf("DNS and TCP request logging is enabled.\n");
     }
+
     pthread_t udp_thread;
     pthread_create(&udp_thread, NULL, (void*(*)(void*))start_udp_server, &params);
     pthread_detach(udp_thread);
+
     start_tcp_server(&params);
     return 0;
 }
