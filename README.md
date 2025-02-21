@@ -65,18 +65,23 @@ ssh root@192.168.8.1
 
 Set up the necessary firewall and NAT rules:
 
+Redirect 80 & 443
 ```sh
-iptables -t nat -F PREROUTING
-iptables -F INPUT
-
-iptables -t nat -A PREROUTING -i br-guest -s 192.168.9.0/24 -p tcp -j DNAT --to-destination 192.168.9.1:9040
-iptables -A INPUT -i br-guest -p tcp --dport 9040 -j ACCEPT
-iptables -t nat -A PREROUTING -i br-guest -s 192.168.9.0/24 -p udp --dport 53 -j DNAT --to-destination 192.168.9.1:9053
-iptables -A INPUT -i br-guest -p udp --dport 9053 -j ACCEPT
-
-iptables -t nat -A PREROUTING -i br-guest -s 192.168.9.0/24 -d 192.168.9.0/24 -p tcp -j ACCEPT
-iptables -t nat -A PREROUTING -i br-guest -s 192.168.9.0/24 -d 192.168.9.0/24 -p udp ! --dport 53 -j ACCEPT
+cat << 'EOF' > /etc/firewall.user
+nft add table inet t2hp
+nft add chain inet t2hp prerouting { type nat hook prerouting priority -100 \; }
+# nft add rule inet t2hp prerouting ip saddr 192.168.9.0/24 tcp dport 80 counter dnat to 192.168.9.1:9040 # redirect only 80 TCP
+# nft add rule inet t2hp prerouting ip saddr 192.168.9.0/24 tcp dport 443 counter dnat to 192.168.9.1:9040 # redirect only 443 TCP
+nft add rule inet t2hp prerouting ip saddr 192.168.9.0/24 ip daddr != 192.168.9.0/24 tcp dport != 9040 counter dnat to 192.168.9.1:9040 # redirect all TCP
+nft add rule inet t2hp prerouting ip saddr 192.168.9.0/24 udp dport 53 counter dnat to 192.168.9.1:9053
+nft add chain inet t2hp input { type filter hook input priority 0 \; }
+nft add rule inet t2hp input ip saddr 192.168.9.0/24 tcp dport 9040 accept
+nft add rule inet t2hp input ip saddr 192.168.9.0/24 udp dport 9053 accept
+EOF
+chmod +x /etc/firewall.user
+/etc/firewall.user
 ```
+
 
 ## Running T2HP
 
